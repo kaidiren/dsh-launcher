@@ -20,6 +20,7 @@
 #   DSH_WINDOW_WIDTH/HEIGHT 仅 custom 模式使用的窗口尺寸，默认 1180x800
 #   DSH_REUSE_WINDOW        1（默认）复用已有窗口；0 则每次都开新窗口
 #   DSH_TRAY                1（默认）启动菜单栏图标；0 则不启动
+#   DSH_FLAG_MAX_AGE        停止/重启标志的有效期（秒），默认 90；过期标志不执行
 #   DSH_LAUNCHER_DRY_RUN    置 1 时只做决策不做动作（用于自检）
 #
 # 额外参数：本脚本收到的参数会原样转给 `dsh web`。Dock 点击时没有参数。
@@ -35,8 +36,18 @@ PID_FILE="${LAUNCHER_DIR}/dsh-web.pid"
 URL_FILE="${LAUNCHER_DIR}/dsh-web.url"
 CHROME_LOG="${LAUNCHER_DIR}/chrome.log"
 TRAY_LOG="${LAUNCHER_DIR}/tray.log"
+TRAY_PID_FILE="${LAUNCHER_DIR}/dsh-tray.pid"
 LOCK_DIR="${LAUNCHER_DIR}/.dsh-start.lock"
-STOP_FLAG="${LAUNCHER_DIR}/.dsh-stop-request"
+# 菜单栏「退出 / 重启」的请求标志：写成文件、再由本脚本（经 .app）执行动作。
+# 文件名带端口，避免在别的端口上做实验留下的标志被本端口实例当成自己的请求；
+# 同时保留旧版无端口后缀的名字以兼容老托盘。
+STOP_FLAG="${LAUNCHER_DIR}/.dsh-stop-request-${PORT}"
+RESTART_FLAG="${LAUNCHER_DIR}/.dsh-restart-request-${PORT}"
+STOP_FLAG_LEGACY="${LAUNCHER_DIR}/.dsh-stop-request"
+RESTART_FLAG_LEGACY="${LAUNCHER_DIR}/.dsh-restart-request"
+# 标志文件的最长有效年龄（秒）：中断的操作留下的陈旧标志必须自动作废，
+# 否则几分钟后一次普通点击就会把正在用的服务停掉/重启掉。
+FLAG_MAX_AGE="${DSH_FLAG_MAX_AGE:-90}"
 URL="http://127.0.0.1:${PORT}/"
 CURL=/usr/bin/curl
 LSOF=/usr/sbin/lsof
@@ -214,12 +225,17 @@ ensure_window() {
 # 由菜单栏「退出 DSH」触发：托盘先写下 STOP_FLAG，再用 open -a 拉起本 app。
 # 必须绕这一圈：AppleScript 的权限是按「发起进程」判定的，从托盘（裸二进制）
 # 直接发会被 TCC 拒掉（-1743 未授权发送 Apple 事件），而经 app 启动就和点 Dock 一致。
-do_stop_all() {
-  log "整体停止：关窗口 → 停服务 → 退菜单栏图标"
-
-  if [ -d "${CHROME_APP}" ] && /usr/bin/pgrep -x "Google Chrome" >/dev/null 2>&1; then
-    local sf="${LAUNCHER_DIR}/.dsh-close.applescript" res
-    cat >"${sf}" <<APPLESCRIPT
+# ---------- 关闭 GUI 窗口 ----------
+# 关掉所有指向本 GUI 的 Chrome 窗口。
+#
+# 注意：AppleScript 的权限按「发起进程」判定——从菜单栏托盘（裸二进制）直接发会被
+# TCC 拒掉（-1743 未授权发送 Apple 事件）。所以托盘的每个动作都先写标志、再用
+# `open -a` 拉起本 app，由 app 来执行这里的 AppleScript（主体与点 Dock 图标一致）。
+close_gui_windows() {
+  [ -d "${CHROME_APP}" ] || return 0
+  /usr/bin/pgrep -x "Google Chrome" >/dev/null 2>&1 || return 0
+  local sf="${LAUNCHER_DIR}/.dsh-close.applescript" res
+  cat >"${sf}" <<APPLESCRIPT
 if application "Google Chrome" is running then
 	tell application "Google Chrome"
 		repeat with w in windows
@@ -234,11 +250,14 @@ if application "Google Chrome" is running then
 end if
 return "closed"
 APPLESCRIPT
-    res="$(run_limited 10 /usr/bin/osascript "${sf}")"
-    rm -f "${sf}"
-    log "  关闭窗口结果：${res:-（空）}"
-  fi
+  res="$(run_limited 10 /usr/bin/osascript "${sf}")"
+  rm -f "${sf}"
+  log "  关闭窗口结果：${res:-（空）}"
+}
 
+# ---------- 停止后台服务 ----------
+# 服务是 nohup 起的独立进程，窗口只是它的客户端；这里按 pid 文件停掉它。
+stop_service() {
   if [ -f "${PID_FILE}" ]; then
     local pid
     pid="$(cat "${PID_FILE}" 2>/dev/null)"
@@ -249,9 +268,41 @@ APPLESCRIPT
   else
     log "  没有 pid 文件，跳过停服务"
   fi
+}
 
+# ---------- 整体停止 ----------
+# 关窗口 → 停服务 → 撤掉菜单栏图标。由菜单栏「退出」触发（STOP_FLAG + open -a）。
+do_stop_all() {
+  log "整体停止：关窗口 → 停服务 → 退菜单栏图标"
+  close_gui_windows
+  stop_service
   /usr/bin/pkill -f "${LAUNCHER_DIR}/dsh-tray" 2>/dev/null && log "  已撤掉菜单栏图标"
+  # 托盘被直接杀掉时来不及自己清 pid 文件；这里顺手清掉，避免下次判断"以为它在跑"
+  rm -f "${TRAY_PID_FILE}" 2>/dev/null
   return 0
+}
+
+# ---------- 重启 ----------
+# 关窗口 → 停服务 → 等端口释放 → 重新执行本脚本，完整走一遍启动流程。
+# 由菜单栏「重启」触发（RESTART_FLAG + open -a）。
+do_restart_all() {
+  log "重启：关窗口 → 停服务 → 重新拉起"
+  close_gui_windows
+  stop_service
+
+  # 等端口真正释放，否则紧接着的启动会以为服务还在跑而直接复用
+  local i=0
+  while [ "${i}" -lt 60 ]; do
+    service_running || break
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  # exec 不触发 EXIT trap，所以必须先手动放锁，否则新进程会一直等在锁上
+  release_start_lock
+  trap - EXIT INT TERM
+  log "重新执行启动器"
+  exec "${LAUNCHER_DIR}/launch-dsh-web.sh" "$@"
 }
 
 # ---------- 流程互斥锁 ----------
@@ -278,6 +329,41 @@ acquire_start_lock() {
 
 release_start_lock() { rm -rf "${LOCK_DIR}" 2>/dev/null; }
 
+# 取用标志文件：存在、且足够「新鲜」才算数，看过就删。
+# 两个作用：只认本端口专属的名字（外加兼容旧版无后缀名），并且给标志加保质期——
+# 一次被中断的实验、或被杀掉的启动器留下的标志，不该在几分钟后突然生效。
+take_flag() {
+  local f now mtime age
+  for f in "$@"; do
+    [ -f "${f}" ] || continue
+    now="$(date +%s)"
+    mtime="$(stat -f %m "${f}" 2>/dev/null || echo 0)"
+    case "${mtime}" in ''|*[!0-9]*) mtime=0 ;; esac
+    age=$(( now - mtime ))
+    rm -f "${f}" 2>/dev/null
+    if [ "${age}" -le "${FLAG_MAX_AGE}" ]; then
+      log "收到 ${f##*/}（${age} 秒前写入）"
+      return 0
+    fi
+    log "忽略陈旧标志 ${f##*/}（${age} 秒前写入，已超过 ${FLAG_MAX_AGE} 秒）"
+  done
+  return 1
+}
+
+# 找回带 token 的认证 URL：URL 缓存文件被清理、或某次启动没抓到 token 时，
+# 回日志里翻最后一次出现的认证 URL 补写回缓存。
+# 日志是追加写的，所以「最后一次出现的 token」就是当前服务的 token——
+# 这样认证链接在什么时候丢了都能自愈，而不必靠重启服务再抓一次。
+recover_token_url() {
+  [ -f "${LOG}" ] || return 1
+  local found
+  found="$(/usr/bin/grep -a -o "${TOKEN_RE}" "${LOG}" 2>/dev/null | /usr/bin/tail -1)"
+  [ -n "${found}" ] || return 1
+  printf '%s\n' "${found}" >"${URL_FILE}" 2>/dev/null
+  log "已从日志里找回认证 URL，补写 ${URL_FILE}"
+  printf '%s' "${found}"
+}
+
 # ---------- 菜单栏常驻图标 ----------
 # 显示后台服务状态：运行中为蓝色鲸鱼，未运行是跟随菜单栏明暗的模板图标。
 # 左键点击打开/聚焦窗口，右键出菜单（打开窗口 / 停止服务 / 退出图标）。
@@ -285,11 +371,25 @@ ensure_tray() {
   [ "${TRAY_ENABLED}" = "1" ] || return 0
   [ "${DRY_RUN}" = "1" ] && { echo "WOULD_START_TRAY"; return 0; }
   [ -x "${LAUNCHER_DIR}/dsh-tray" ] || return 0
-  if /usr/bin/pgrep -f "${LAUNCHER_DIR}/dsh-tray" >/dev/null 2>&1; then
+  # 托盘要知道自己在盯哪个端口：它据此判断服务状态，也据此决定写的标志文件名。
+  # 只允许一个托盘常驻（菜单栏上出现两只鲸鱼没有意义），已经在跑就直接复用。
+  # 优先看托盘自己写的 pid 文件（准），pgrep 兜底（pid 文件可能被清理过）。
+  if [ -f "${TRAY_PID_FILE}" ]; then
+    TRAY_PID="$(cat "${TRAY_PID_FILE}" 2>/dev/null || echo "")"
+    if [ -n "${TRAY_PID}" ] && kill -0 "${TRAY_PID}" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "${TRAY_PID_FILE}" 2>/dev/null
+  fi
+  # pid 文件丢了就从进程表里找回来并补写，下次判断就不必再扫进程表
+  TRAY_PID="$(/usr/bin/pgrep -f "${LAUNCHER_DIR}/dsh-tray" 2>/dev/null | head -1)"
+  if [ -n "${TRAY_PID}" ]; then
+    printf '%s\n' "${TRAY_PID}" >"${TRAY_PID_FILE}" 2>/dev/null
     return 0
   fi
-  nohup "${LAUNCHER_DIR}/dsh-tray" >>"${TRAY_LOG}" 2>&1 &
-  log "菜单栏图标已启动（pid=$!）"
+  DSH_WEB_PORT="${PORT}" DSH_LAUNCHER_DIR="${LAUNCHER_DIR}" DSH_TRAY_PID_FILE="${TRAY_PID_FILE}" \
+    nohup "${LAUNCHER_DIR}/dsh-tray" >>"${TRAY_LOG}" 2>&1 &
+  log "菜单栏图标已启动（pid=$!，port=${PORT}）"
 }
 
 log "---- 启动器被触发（port=${PORT}, dry_run=${DRY_RUN}）----"
@@ -305,10 +405,15 @@ if [ "${DRY_RUN}" != "1" ]; then
   trap 'release_start_lock' EXIT INT TERM
 fi
 
-# ---------- 停止请求（来自菜单栏「退出 DSH」）----------
-if [ -f "${STOP_FLAG}" ]; then
-  rm -f "${STOP_FLAG}"
+# ---------- 停止请求（来自菜单栏「退出」）----------
+if take_flag "${STOP_FLAG}" "${STOP_FLAG_LEGACY}"; then
   do_stop_all
+  exit 0
+fi
+
+# ---------- 重启请求（来自菜单栏「重启」）----------
+if take_flag "${RESTART_FLAG}" "${RESTART_FLAG_LEGACY}"; then
+  do_restart_all "$@"
   exit 0
 fi
 
@@ -334,6 +439,15 @@ if service_running; then
       *) log "忽略过期的 URL 缓存（端口不是 ${PORT}）：${CACHED}" ;;
     esac
   fi
+  # 缓存丢了就去日志里找回来：没有 token 的连接会被服务端判成「需要认证」，
+  # 用户看到的是「请重新打开 dsh web 打印的地址」，而地址不该只能靠重启拿到。
+  case "${SHOWN_URL}" in
+    *token=*) : ;;
+    *)
+      RECOVERED="$(recover_token_url)"
+      [ -n "${RECOVERED}" ] && SHOWN_URL="${RECOVERED}"
+      ;;
+  esac
   ensure_window "${SHOWN_URL}"
   ensure_tray
   exit 0
@@ -393,7 +507,12 @@ if [ -n "${TOKEN_URL}" ]; then
   ensure_window "${TOKEN_URL}"
 else
   log "未取到 token URL，退回根地址"
-  rm -f "${URL_FILE}"
+  # 旧缓存里的 token 属于上一个进程，留着只会让人以为还能用；先记进日志再删，
+  # 万一需要人工找回也有据可查（日志本身不会被这个脚本清理）。
+  if [ -f "${URL_FILE}" ]; then
+    log "作废旧缓存：$(head -1 "${URL_FILE}" 2>/dev/null)"
+    rm -f "${URL_FILE}"
+  fi
   ensure_window "${URL}"
 fi
 

@@ -21,11 +21,20 @@ if ! command -v swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+# Apple Silicon 机器上，如果 shell 自己跑在 Rosetta 下（uname -m 报 x86_64），
+# swiftc 就会按 x86_64 编译，而 SDK 里没有对应的 Swift 模块接口，报
+# "failed to build module 'Swift'"。显式用 arch -arm64 走原生就能编过。
+SWIFTC=(swiftc)
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ] && [ "$(uname -m)" != "arm64" ]; then
+  echo "    检测到 shell 运行在 Rosetta 下，改用 arch -arm64 swiftc"
+  SWIFTC=(arch -arm64 swiftc)
+fi
+
 echo "==> 编译 screen-bounds（取屏幕可用区域）"
-swiftc -O -o screen-bounds screen-bounds.swift
+"${SWIFTC[@]}" -O -o screen-bounds screen-bounds.swift
 
 echo "==> 编译 dsh-tray（菜单栏图标）"
-swiftc -O -o dsh-tray dsh-tray.swift
+"${SWIFTC[@]}" -O -o dsh-tray dsh-tray.swift
 
 if [ -f "$HERE/icons/app-icon-mac.png" ]; then
   echo "==> 生成应用图标 AppIcon.icns"

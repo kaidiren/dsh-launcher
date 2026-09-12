@@ -11,6 +11,10 @@ screen-bounds
 *.log
 dsh-web.pid
 dsh-web.url
+dsh-tray.pid
 .dsh-*.applescript
+.dsh-focus.*
 .dsh-start.lock/
+.dsh-stop-request*
+.dsh-restart-request*
 .tmp/

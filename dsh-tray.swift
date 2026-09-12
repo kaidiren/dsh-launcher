@@ -9,6 +9,9 @@ let port = ProcessInfo.processInfo.environment["DSH_WEB_PORT"] ?? "3080"
 let iconFile = "\(launcherDir)/icons/tray-iconTemplate@2x.png"
 let launcher = "\(launcherDir)/launch-dsh-web.sh"
 let trayLog = "\(launcherDir)/tray.log"
+// 记下自己的 pid，启动器据此判断「托盘已经在跑」，避免菜单栏上出现两只鲸鱼。
+// 启动器还会用 pgrep 兜底，所以这个文件丢了也只是多一次查找。
+let trayPidFile = ProcessInfo.processInfo.environment["DSH_TRAY_PID_FILE"] ?? "\(launcherDir)/dsh-tray.pid"
 
 // 每个动作都写日志：菜单点了没反应时，先看这里能分清是「没点到」还是「点了没执行」。
 func log(_ msg: String) {
@@ -64,13 +67,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let m = NSMenu()
-        m.addItem(makeItem("打开 DSH 窗口", #selector(openWindow), "o"))
+        m.addItem(makeItem("打开", #selector(openWindow), "o"))
+        m.addItem(makeItem("重启", #selector(restartService), "r"))
         m.addItem(.separator())
-        m.addItem(makeItem("退出 DSH（停服务并退出）", #selector(quitAll), "q"))
+        m.addItem(makeItem("退出", #selector(quitAll), "q"))
         menu = m
 
         refreshTooltip()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refreshTooltip() }
+        try? "\(ProcessInfo.processInfo.processIdentifier)".write(
+            toFile: trayPidFile, atomically: true, encoding: .utf8)
         log("托盘启动（port=\(port), pid=\(ProcessInfo.processInfo.processIdentifier)）")
     }
 
@@ -106,15 +112,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         run("/usr/bin/open", ["-a", "/Applications/DSH Web.app"])
     }
 
+    /// 重启后台服务：关窗口 → 停服务 → 重新拉起 → 重开窗口。
+    /// 和「退出」同样的道理：写标志再 open -a 让 app 去执行（AppleScript 权限按发起
+    /// 进程判定，托盘直接发会被 TCC 拒掉）。托盘自己不用退出，重启后继续常驻。
+    /// 标志文件名带端口：在别的端口上留下的请求不该被本实例认领。
+    @objc func restartService() {
+        log("动作：重启 DSH（port=\(port)）")
+        try? "".write(toFile: "\(launcherDir)/.dsh-restart-request-\(port)", atomically: true, encoding: .utf8)
+        run("/usr/bin/open", ["-a", "/Applications/DSH Web.app"])
+        // 冷启动 + 开窗要几秒，稍后刷新一次状态提示
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in self?.refreshTooltip() }
+    }
+
     /// 整体退出：关窗口 + 停服务 + 撤图标。
     /// 关窗口要走 AppleScript，而它的权限按发起进程判定——托盘直接发会被 TCC 拒
     /// （-1743），所以这里写下停止标志、让 app 去执行（和点 Dock 图标同一个主体）。
     @objc func quitAll() {
-        log("动作：退出 DSH（关窗口 + 停服务 + 退图标）")
-        try? "".write(toFile: "\(launcherDir)/.dsh-stop-request", atomically: true, encoding: .utf8)
+        log("动作：退出 DSH（关窗口 + 停服务 + 退图标，port=\(port)）")
+        try? "".write(toFile: "\(launcherDir)/.dsh-stop-request-\(port)", atomically: true, encoding: .utf8)
         run("/usr/bin/open", ["-a", "/Applications/DSH Web.app"])
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             if let it = self?.item { NSStatusBar.system.removeStatusItem(it) }
+            // 自己撤掉后，pid 文件就不该再留着让启动器以为托盘还在
+            try? FileManager.default.removeItem(atPath: trayPidFile)
             log("  撤掉菜单栏图标，退出")
             NSApp.terminate(nil)
             exit(0)

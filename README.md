@@ -37,7 +37,7 @@ cp -R "DSH Web.app" /Applications/          # 需要写 /Applications 的权限
 | 文件 | 作用 |
 |---|---|
 | `launch-dsh-web.sh` | 主逻辑：进程检测、窗口检测/开窗、满屏、菜单栏图标拉起、整体停止 |
-| `dsh-tray.swift` | 菜单栏常驻图标（黑鲸鱼）：状态显示、打开窗口、退出 DSH |
+| `dsh-tray.swift` | 菜单栏常驻图标（黑鲸鱼）：状态显示、打开窗口、重启、退出 |
 | `screen-bounds.swift` | 小工具：输出屏幕可用区域，供窗口撑满用 |
 | `make-icon.swift` | 早期用 CoreGraphics 画图标的脚本（现在图标来自 `icons/`） |
 | `build.sh` | 一键构建 |
@@ -46,7 +46,8 @@ cp -R "DSH Web.app" /Applications/          # 需要写 /Applications 的权限
 
 **生成物（不提交）**：`DSH Web.app/`、`AppIcon.icns`、`AppIcon.iconset/`、
 `dsh-tray`、`screen-bounds`、`icon-1024.png`，以及运行期产物
-`dsh-web.log`／`chrome.log`／`tray.log`／`dsh-web.pid`／`dsh-web.url`／`.module-cache/`。
+`dsh-web.log`／`chrome.log`／`tray.log`／`dsh-web.pid`／`dsh-web.url`、
+标志文件 `.dsh-stop-request-<端口>`／`.dsh-restart-request-<端口>`、`.module-cache/`。
 
 ## 行为
 
@@ -70,17 +71,27 @@ cp -R "DSH Web.app" /Applications/          # 需要写 /Applications 的权限
 
 服务启动等待上限约 60 秒，token 再等最多 15 秒。
 
+**认证 URL 随时可找回**：`dsh-web.url` 缓存丢失时（被清理过、或某次启动没抓到 token），
+启动器会去 `dsh-web.log` 里翻最后一次出现的认证 URL 补写回缓存。日志是追加写的，
+所以"最后一次出现的 token"就是当前服务的 token——不必为了拿回地址而重启服务。
+日志里出现过 token 就是本机凭据，别外传，也别把日志提交进仓库（`.gitignore` 已排除 `*.log`）。
+
 ## 菜单栏图标
 
 `dsh-tray` 是菜单栏上的一只**黑鲸鱼**——它在，就代表 DSH 在跑：
 
 - **左键** → 打开/聚焦窗口
-- **右键** → 两项菜单：
-  - `打开 DSH 窗口`
-  - `退出 DSH（停服务并退出）` ← 关窗口 + 停后台进程 + 撤掉图标
+- **右键** → 三项菜单：
+  - `打开`（⌘O）→ 同左键
+  - `重启`（⌘R）→ 关窗口 + 停服务 + 重新拉起 + 重开窗口（改了配置、或 cookie/认证状态乱了时用）
+  - `退出`（⌘Q）→ 关窗口 + 停后台进程 + 撤掉菜单栏图标
 
-启动器开好窗口后会自动拉起它（已在跑就不重复启动）。不想要就把脚本里的
+`打开` 和 `重启` 之后托盘继续常驻；只有 `退出` 会让它自己消失。
+启动器开好窗口后会自动拉起托盘（已在跑就不重复启动，并把当前端口传给它）。不想要就把脚本里的
 `DSH_TRAY` 默认值改成 `0`。它每个动作都会写 `tray.log`，点菜单没反应时先看那里。
+
+托盘也只会有一个：它启动时把 pid 写进 `dsh-tray.pid`，启动器先读这个文件、再拿 `pgrep` 兜底，
+两边都对不上才新起一个——否则菜单栏上会出现两只鲸鱼。
 
 ## 自定义
 
@@ -95,6 +106,7 @@ REUSE_WINDOW="${DSH_REUSE_WINDOW:-1}"       # 0 = 不做窗口检测，每次直
 TRAY_ENABLED="${DSH_TRAY:-1}"               # 0 = 不启动菜单栏图标
 WORKDIR="${DSH_WORKDIR:-/Users/rkd/dsh}"    # GUI 会话的起始目录
 DSH_BIN="${DSH_BIN:-...}"                   # dsh 可执行文件绝对路径
+FLAG_MAX_AGE="${DSH_FLAG_MAX_AGE:-90}"      # 停止/重启标志的有效期（秒），过期不执行
 ```
 
 `launch-dsh-web.sh` 是唯一的真源：改它立即生效，不用重装 app（`.app` 只是个薄壳）。
@@ -102,7 +114,7 @@ DSH_BIN="${DSH_BIN:-...}"                   # dsh 可执行文件绝对路径
 
 自检：`DSH_LAUNCHER_DRY_RUN=1 ./launch-dsh-web.sh` 只做决策不做动作。
 
-## 实现上的六个坑
+## 实现上的几个坑
 
 都是实际踩过的，改动时注意别踩回去：
 
@@ -136,7 +148,19 @@ DSH_BIN="${DSH_BIN:-...}"                   # dsh 可执行文件绝对路径
    （`-1743 未获得授权将 Apple 事件发送给 Google Chrome`），症状正是「从 Dock 启动后
    再点菜单栏图标就重复开窗口」。所以托盘里的动作都改成
    `open -a "/Applications/DSH Web.app"` 交给 app 去做；「退出 DSH」另写一个
-   `.dsh-stop-request` 标志，由 app 看到后执行关窗口 + 停服务 + 撤图标。
+   `.dsh-stop-request-<端口>` 标志，由 app 看到后执行关窗口 + 停服务 + 撤图标。
+   「重启」同理，写 `.dsh-restart-request-<端口>`。
+
+8. **标志文件要带端口、还要有保质期。** 一开始标志叫 `.dsh-stop-request`，不带端口——
+   于是任何一次「在别的端口上做实验」留下的标志，都会被**正在用的那个实例**认领成
+   自己的请求，把用户的服务重启掉（实际发生过：浏览器随即提示需要重新认证）。
+   现在文件名带端口，且只认自己端口（外加旧版无后缀名，兼容老托盘）；同时
+   `take_flag` 只看**90 秒内**写入的标志，陈旧的一律清掉不执行（`DSH_FLAG_MAX_AGE` 可调）。
+
+9. **在 Rosetta 下跑 `build.sh` 会编译失败。** 如果 shell 自己跑在 Rosetta 下
+   （`uname -m` 报 `x86_64`，而机器是 Apple Silicon），`swiftc` 会按 x86_64 编译，
+   而 SDK 里没有对应的 Swift 模块接口，报 `failed to build module 'Swift'`。
+   `build.sh` 现在会检测 `sysctl -n hw.optional.arm64` 并自动改用 `arch -arm64 swiftc`。
 
 > 第 5、6、7 条这类失败**不会弹授权框、日志里也不显眼**，所以别用「有没有弹窗」来判断
 > 权限问题。调试时保留 `run_limited` 里的 `2>&1`，错误信息才会进日志。
@@ -158,9 +182,21 @@ Object.keys(localStorage).filter(k => k.startsWith('dsh')).forEach(k => localSto
 `dsh-web.log` 里 `窗口检测：结果=` 那行返回的是 `focused` 还是空/报错。
 
 **点了菜单栏图标没反应**
-看 `tray.log`。里面会记「动作：打开窗口 / 退出 DSH」；如果只有「图标被点击」没有后续动作，
-说明菜单项的 action 没派发（早期版本用「挂菜单 → performClick → 立刻摘掉」会这样，
-现在改用 `popUpMenu` 同步弹菜单）。
+看 `tray.log`。里面会记「动作：打开窗口 / 重启 DSH / 退出 DSH」；如果只有「图标被点击」
+没有后续动作，说明菜单项的 action 没派发（早期版本用「挂菜单 → performClick → 立刻摘掉」
+会这样，现在改用 `popUpMenu` 同步弹菜单）。
+
+**浏览器里提示需要认证 / `dsh web authentication required`**
+服务重启后进程 token 变了，浏览器里旧 cookie 就失效了（表现为「请重新打开 dsh web 打印的地址」）。
+取回当前地址：
+
+```sh
+cat ~/dsh/dsh-launcher/dsh-web.url        # 缓存；丢了的话看下一行
+grep -a -o 'http://127\.0\.0\.1:3080/?token=[A-Za-z0-9_-]*' ~/dsh/dsh-launcher/dsh-web.log | tail -1
+```
+
+用该地址打开即可恢复。不想动命令行就右键菜单栏图标 → `重启`，会重新开一个带新 token 的窗口。
+同理，如果只想让某个页面恢复，把它的地址换上新 token 即可；**token 是本机凭据，不要外传**。
 
 ## 其他
 
