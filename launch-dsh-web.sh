@@ -364,6 +364,15 @@ recover_token_url() {
   printf '%s' "${found}"
 }
 
+# 这个认证 URL 现在还被服务接受吗？正确的 token 返回 303（设置 cookie 后跳转），
+# 错误或没带 token 返回 401。用它来判断缓存里的 token 是不是已经过期。
+# 只发一个本地 GET，不改动任何状态。（服务不可达时 curl 返回 000，也算不可用。）
+url_accepted() {
+  local code
+  code="$("${CURL}" -s -o /dev/null -m 3 -w '%{http_code}' "$1" 2>/dev/null)"
+  [ -n "${code}" ] && [ "${code}" != "401" ] && [ "${code}" != "000" ]
+}
+
 # ---------- 菜单栏常驻图标 ----------
 # 显示后台服务状态：运行中为蓝色鲸鱼，未运行是跟随菜单栏明暗的模板图标。
 # 左键点击打开/聚焦窗口，右键出菜单（打开窗口 / 停止服务 / 退出图标）。
@@ -430,24 +439,38 @@ if service_running; then
       log "已从端口反查补写 pid=${RUNNING_PID}"
     fi
   fi
-  SHOWN_URL="${URL}"
+  # 挑一个「当前这个服务真的接受」的认证 URL：
+  #   1) 缓存里的 —— 大多数时候就是它；
+  #   2) 日志里最后一次出现的 —— 服务被别处重启过时缓存里的 token 已失效，日志里那条才是新的；
+  #   3) 都不可用就退回根地址（浏览器会提示需要认证，README 里有找回办法）。
+  # 判定靠真的发一次请求：正确的 token 返回 303（设置 cookie 后跳转），错的返回 401。
+  # 这样就不会把用户丢进「dsh web authentication required」那个页面。
+  SHOWN_URL=""
   if [ -f "${URL_FILE}" ]; then
     CACHED="$(head -1 "${URL_FILE}" 2>/dev/null)"
     # 只认端口匹配的缓存：改过端口后旧文件指向的是旧服务的地址，直接用会开错窗口
     case "${CACHED}" in
-      *"127.0.0.1:${PORT}/"*) SHOWN_URL="${CACHED}" ;;
+      *"127.0.0.1:${PORT}/"*)
+        if url_accepted "${CACHED}"; then
+          SHOWN_URL="${CACHED}"
+        else
+          log "URL 缓存里的 token 已失效（服务重启过？），去日志里找新的"
+        fi
+        ;;
       *) log "忽略过期的 URL 缓存（端口不是 ${PORT}）：${CACHED}" ;;
     esac
   fi
-  # 缓存丢了就去日志里找回来：没有 token 的连接会被服务端判成「需要认证」，
-  # 用户看到的是「请重新打开 dsh web 打印的地址」，而地址不该只能靠重启拿到。
-  case "${SHOWN_URL}" in
-    *token=*) : ;;
-    *)
-      RECOVERED="$(recover_token_url)"
-      [ -n "${RECOVERED}" ] && SHOWN_URL="${RECOVERED}"
-      ;;
-  esac
+  if [ -z "${SHOWN_URL}" ]; then
+    RECOVERED="$(recover_token_url)"
+    if [ -n "${RECOVERED}" ]; then
+      if url_accepted "${RECOVERED}"; then
+        SHOWN_URL="${RECOVERED}"
+      else
+        log "日志里的认证 URL 也被拒绝（可能不是当前进程打印的）"
+      fi
+    fi
+  fi
+  [ -n "${SHOWN_URL}" ] || SHOWN_URL="${URL}"
   ensure_window "${SHOWN_URL}"
   ensure_tray
   exit 0

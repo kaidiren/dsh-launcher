@@ -71,10 +71,16 @@ cp -R "DSH Web.app" /Applications/          # 需要写 /Applications 的权限
 
 服务启动等待上限约 60 秒，token 再等最多 15 秒。
 
-**认证 URL 随时可找回**：`dsh-web.url` 缓存丢失时（被清理过、或某次启动没抓到 token），
-启动器会去 `dsh-web.log` 里翻最后一次出现的认证 URL 补写回缓存。日志是追加写的，
-所以"最后一次出现的 token"就是当前服务的 token——不必为了拿回地址而重启服务。
-日志里出现过 token 就是本机凭据，别外传，也别把日志提交进仓库（`.gitignore` 已排除 `*.log`）。
+**认证 URL 随时可找回，且会自己换新**：启动器在开窗之前，会对候选地址真的发一次请求看看
+服务认不认（正确 token → `303` 设置 cookie，错的 → `401`）。所以：
+
+- 缓存 `dsh-web.url` 里的 token 还有效 → 直接用；
+- 已失效（服务在别处被重启过，token 换了）→ 自动去 `dsh-web.log` 里翻最后一次出现的
+  认证 URL，验证通过就用它，并刷新缓存。
+
+日志是追加写的，所以"最后一次出现的 token"就是当前服务的 token——不必为了拿回地址而重启服务。
+日志与 `dsh-web.url` 里出现的 token 是本机凭据，别外传，也别把日志提交进仓库
+（`.gitignore` 已排除 `*.log`）。
 
 ## 菜单栏图标
 
@@ -188,7 +194,8 @@ Object.keys(localStorage).filter(k => k.startsWith('dsh')).forEach(k => localSto
 
 **浏览器里提示需要认证 / `dsh web authentication required`**
 服务重启后进程 token 变了，浏览器里旧 cookie 就失效了（表现为「请重新打开 dsh web 打印的地址」）。
-取回当前地址：
+从 Dock 再点一次图标通常就好了——启动器会验证 token、失效就自动换成日志里最新的那条。
+要手动取回当前地址：
 
 ```sh
 cat ~/dsh/dsh-launcher/dsh-web.url        # 缓存；丢了的话看下一行
