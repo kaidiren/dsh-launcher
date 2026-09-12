@@ -1,0 +1,16 @@
+# ---- 构建产物（由 build.sh 生成）----
+DSH Web.app/
+AppIcon.icns
+AppIcon.iconset/
+icon-1024.png
+dsh-tray
+screen-bounds
+.module-cache/
+
+# ---- 运行期产物 ----
+*.log
+dsh-web.pid
+dsh-web.url
+.dsh-*.applescript
+.dsh-start.lock/
+.tmp/
